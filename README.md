@@ -10,6 +10,15 @@ its own canvas**.
 |---|---|
 | ![linked](docs/linked.png) | ![unlinked](docs/unlinked.png) |
 
+## Install
+
+Download **Arrange-1.0.dmg** from [Releases](https://github.com/hailports/arrange/releases/latest), open it, and drag
+Arrange to Applications.
+
+It is ad-hoc signed and **not notarized**, so the first launch is blocked with "Apple could not verify…".
+Open **System Settings › Privacy & Security**, click **Open Anyway** next to Arrange, and confirm. Then allow it under
+**Privacy & Security › Accessibility**. The Universal Control features need that permission.
+
 ## What it does
 
 - **Arrange real displays.** Drag to rearrange, Option-drag onto another display to mirror,
