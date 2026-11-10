@@ -9,6 +9,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.install()
         if ProcessInfo.processInfo.environment["ARRANGE_SHOW"] == "1" {
             DispatchQueue.main.async { self.panel.show() }
+        } else {
+            ArrangeMain.promptForAccessibilityIfNeeded()
         }
     }
 
@@ -27,7 +29,9 @@ enum ArrangeMain {
             let layoutOK = LayoutSelfTest.run()
             let sample = "10:52:45.761  Add        3  11 local.               _airplay._tcp.       Example TV"
             let parsed = ServiceBrowser.parseBrowse(sample)
+            let morning = ServiceBrowser.parseBrowse(" 7:24:38.331  Add        3  11 local.               _companion-link._tcp. alex's iPad pro")
             let parseOK = parsed?.add == true && parsed?.name == "Example TV" && (parsed?.type.hasPrefix("_airplay._tcp") == true)
+                && morning?.add == true && morning?.name == "alex's iPad pro"
             if !parseOK {
                 fputs("FAIL parseBrowse got \(String(describing: parsed))\n", stderr)
             }
@@ -47,5 +51,15 @@ enum ArrangeMain {
         app.setActivationPolicy(.accessory)
         app.delegate = appDelegate
         app.run()
+    }
+
+    /// One prompt per OS build. An update drops the Accessibility grant; the next login asks again.
+    static func promptForAccessibilityIfNeeded() {
+        guard !UCArranger.trusted else { return }
+        let build = ProcessInfo.processInfo.operatingSystemVersionString
+        let key = "axPromptedBuild"
+        guard UserDefaults.standard.string(forKey: key) != build else { return }
+        UserDefaults.standard.set(build, forKey: key)
+        UCArranger.promptForTrust()
     }
 }

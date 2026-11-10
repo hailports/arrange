@@ -369,4 +369,10 @@ enum UCArranger {
     static func fold(_ s: String) -> String {
         s.replacingOccurrences(of: "’", with: "'").folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
     }
+
+    /// "alex's iPad pro" and the older Displays-menu name "alex's iPad pro (2)" are one peer.
+    static func samePeer(_ a: String, _ b: String) -> Bool {
+        let x = fold(a), y = fold(b)
+        return x == y || x.hasPrefix(y) || y.hasPrefix(x)
+    }
 }

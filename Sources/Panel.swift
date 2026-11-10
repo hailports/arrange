@@ -505,12 +505,20 @@ final class MirrorPanelController: NSObject {
     }
 
     private var holdTimer: Timer?
+    private var linkTimer: Timer?
+    private var linkSignature = ""
 
     func install() {
         ArrangementHold.touch()
         holdTimer?.invalidate()
         holdTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
             ArrangementHold.touch()
+        }
+        // UC and Bonjour come up after login. Keep looking so a boot or a later link
+        // shows the iPad without reopening the panel.
+        linkTimer?.invalidate()
+        linkTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            self?.reloadDisplays()
         }
         let image = Self.statusImage()
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -534,6 +542,8 @@ final class MirrorPanelController: NSObject {
     func shutdown() {
         holdTimer?.invalidate()
         holdTimer = nil
+        linkTimer?.invalidate()
+        linkTimer = nil
         ArrangementHold.clear()
         airBrowser.stop()
         nearbyBrowser.stop()
@@ -623,7 +633,14 @@ final class MirrorPanelController: NSObject {
     private func reloadDisplays() {
         guard !canvas.isDragging else { return }
         refreshArrangement()
-        if window.isVisible { rebuild() }
+        let signature = displays.map { "\($0.id) \(Int($0.origin.x)) \(Int($0.origin.y)) \($0.isVirtual)" }.joined(separator: "|")
+            + "|" + (armedUniversalControlName ?? "")
+        if window.isVisible && signature != linkSignature {
+            linkSignature = signature
+            rebuild()
+        } else if !window.isVisible {
+            linkSignature = signature
+        }
     }
 
     private func refreshArrangement() {
@@ -851,19 +868,29 @@ final class MirrorPanelController: NSObject {
         stack.addArrangedSubview(rule())
         stack.addArrangedSubview(labelBlock("Link keyboard and mouse to:", size: 13, weight: .regular, color: .secondaryLabelColor, top: 10, bottom: 4))
         // Once System Settings' link menu has been read, list only the peers it offers.
-        let allowed = universalControlPeers.map { Set($0.map(UCArranger.fold)) }
-        let machines = nearbyMachines.filter { allowed?.contains(UCArranger.fold($0.name)) ?? true }
+        let allowed = universalControlPeers
+        let machines = nearbyMachines.filter { machine in
+            guard let allowed else { return true }
+            return allowed.contains { UCArranger.samePeer($0, machine.name) }
+        }
         if !UniversalControl.isSupported {
             stack.addArrangedSubview(labelBlock("Universal Control isn’t supported on this Mac.", size: 12, weight: .regular, color: .secondaryLabelColor, top: 2, bottom: 8))
         } else if machines.isEmpty {
             stack.addArrangedSubview(labelBlock("No nearby Macs or iPads", size: 12, weight: .regular, color: .tertiaryLabelColor, top: 2, bottom: 8))
         }
         let linked = UniversalControl.hasActiveLink()
+        if linked {
+            let armed = armedUniversalControlName
+            let armedMatches = armed.map { name in machines.contains { UCArranger.samePeer($0.name, name) } } ?? false
+            if !armedMatches, let ipad = machines.first(where: { $0.kind == .ipad }) ?? machines.first {
+                armedUniversalControlName = ipad.name
+            }
+        }
         for machine in machines {
             let row = DeviceRow(title: shownName(machine.name))
             row.symbol = machine.kind == .ipad ? "ipad" : "laptopcomputer"
-            // Blue = the Displays link menu showed a check on this peer, and a real link edge is live.
-            row.filled = linked && armedUniversalControlName.map { UCArranger.fold($0) == UCArranger.fold(machine.name) } == true
+            // Blue = a live UC edge, on the peer that edge belongs to.
+            row.filled = linked && armedUniversalControlName.map { UCArranger.samePeer($0, machine.name) } == true
             row.onClick = { [weak self] in
                 self?.toggleUniversalControl(machine.name)
             }

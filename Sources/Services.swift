@@ -91,8 +91,10 @@ final class ServiceBrowser {
     private var counts: [String: Int] = [:]
     private var records: [String: Record] = [:]
     private var browse: Process?
+    private var browseSource: DispatchSourceRead?
     private var browseBuffer = ""
     private var resolvers: [String: Process] = [:]
+    private var resolveSources: [String: DispatchSourceRead] = [:]
     private let type: String
     private let queue = DispatchQueue(label: "arrange.browse")
 
@@ -108,15 +110,19 @@ final class ServiceBrowser {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = Pipe()
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty else {
-                handle.readabilityHandler = nil
-                return
-            }
+        // FileHandle.readabilityHandler + availableData goes deaf on 27.2.1: the first
+        // callback can be empty, and clearing the handler drops every later browse line.
+        let fd = pipe.fileHandleForReading.fileDescriptor
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        source.setEventHandler { [weak self] in
             guard let self else { return }
-            self.queue.async { self.ingest(String(data: data, encoding: .utf8) ?? "") }
+            var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+            let n = read(fd, &buffer, buffer.count)
+            guard n > 0 else { return }
+            self.ingest(String(bytes: buffer[..<n], encoding: .utf8) ?? "")
         }
+        source.resume()
+        browseSource = source
         do {
             try process.run()
             browse = process
@@ -126,8 +132,12 @@ final class ServiceBrowser {
     }
 
     func stop() {
+        browseSource?.cancel()
+        browseSource = nil
         browse?.terminate()
         browse = nil
+        for source in resolveSources.values { source.cancel() }
+        resolveSources.removeAll()
         for process in resolvers.values { process.terminate() }
         resolvers.removeAll()
     }
@@ -171,25 +181,27 @@ final class ServiceBrowser {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = Pipe()
-        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty else {
-                handle.readabilityHandler = nil
-                return
-            }
-            guard let text = String(data: data, encoding: .utf8), let self else { return }
+        let fd = pipe.fileHandleForReading.fileDescriptor
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+            let n = read(fd, &buffer, buffer.count)
+            guard n > 0, let text = String(bytes: buffer[..<n], encoding: .utf8) else { return }
             let fields = Self.fields(in: text)
             guard !fields.isEmpty else { return }
-            self.queue.async {
-                if var record = self.records[name] {
-                    record.fields.merge(fields) { _, new in new }
-                    self.records[name] = record
-                    self.publish()
-                }
-                self.resolvers[name]?.terminate()
-                self.resolvers[name] = nil
+            if var record = self.records[name] {
+                record.fields.merge(fields) { _, new in new }
+                self.records[name] = record
+                self.publish()
             }
+            self.resolvers[name]?.terminate()
+            self.resolvers[name] = nil
+            self.resolveSources[name]?.cancel()
+            self.resolveSources[name] = nil
         }
+        source.resume()
+        resolveSources[name] = source
         do {
             try process.run()
             resolvers[name] = process
@@ -204,6 +216,9 @@ final class ServiceBrowser {
     }
 
     static func parseBrowse(_ line: String) -> (add: Bool, type: String, name: String)? {
+        // dns-sd pads a single-digit hour with a leading space (" 7:24:38"). Before 10:00
+        // every browse line was skipped, so a morning launch showed no iPad.
+        let line = line.trimmingCharacters(in: .whitespaces)
         let pattern = #"^\S+\s+(Add|Rmv)\s+\d+\s+\d+\s+\S+\s+(\S+)\s+(.+)$"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
         let range = NSRange(line.startIndex..., in: line)
@@ -471,20 +486,29 @@ enum UniversalControl {
         }
     }
 
-    /// With nothing linked, UC still publishes push-to-connect zones: full-height (or full-width) strips
-    /// on the outer sides of the desktop. Seen 2026-11-04: x=2963 and x=-1920, both 2130 tall. Not a link.
+    /// Idle Universal Control publishes push-to-connect zones on opposite outer sides of the
+    /// desktop (seen 2026-11-04: x=2963 and x=-1920, both full desk height). A connected iPad
+    /// on one display is a single outer edge the same size as that display (2026-11-10: left
+    /// edge (0,0,1,840) while Displays showed the iPad beside the built-in screen).
     private static func linkEdgeRects(_ manager: UnsafeRawPointer) -> [CGRect] {
+        let edges = edgeRects(manager)
         var ids = [CGDirectDisplayID](repeating: 0, count: 16)
         var count: UInt32 = 0
-        guard CGGetActiveDisplayList(16, &ids, &count) == .success, count > 0 else { return edgeRects(manager) }
-        let desk = (0..<Int(count)).map { CGDisplayBounds(ids[$0]) }.reduce(CGRect.null) { $0.union($1) }
-        return edgeRects(manager).filter { e in
+        guard CGGetActiveDisplayList(16, &ids, &count) == .success, count > 0 else { return edges }
+        let frames = (0..<Int(count)).map { CGDisplayBounds(ids[$0]) }
+        let desk = frames.reduce(CGRect.null) { $0.union($1) }
+        func spansDesk(_ e: CGRect) -> Bool {
             let fullHeight = e.width <= 1.5 && e.height >= desk.height - 2
                 && (abs(e.minX - desk.minX) < 2 || abs(e.maxX - desk.maxX) < 2)
             let fullWidth = e.height <= 1.5 && e.width >= desk.width - 2
                 && (abs(e.minY - desk.minY) < 2 || abs(e.maxY - desk.maxY) < 2)
-            return !(fullHeight || fullWidth)
+            return fullHeight || fullWidth
         }
+        let partial = edges.filter { !spansDesk($0) }
+        if !partial.isEmpty { return partial }
+        let spanning = edges.filter(spansDesk)
+        // One outer edge is the peer. Two or more are the idle push zones.
+        return spanning.count == 1 ? spanning : []
     }
 
     private static func touches(_ frame: CGRect, _ edge: CGRect) -> Bool {

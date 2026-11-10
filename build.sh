@@ -20,5 +20,10 @@ swiftc -parse-as-library -O -swift-version 5 \
   "$ROOT/Sources/main.swift" \
   "$OBJ"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
-codesign --force --deep --sign "${ARRANGE_SIGN_IDENTITY:--}" "$APP"
+# Stable identity so an OS update does not treat every rebuild as a new app.
+# Override with ARRANGE_SIGN_IDENTITY, or fall back to ad-hoc if this cert is gone.
+SIGN="${ARRANGE_SIGN_IDENTITY:-7894BB24D88A0E407BA41F3BE6F65EAFE068DC80}"
+if ! codesign --force --deep --sign "$SIGN" "$APP"; then
+  codesign --force --deep --sign - "$APP"
+fi
 echo "built $APP"
