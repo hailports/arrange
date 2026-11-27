@@ -16,11 +16,16 @@ if [[ -n "$(git status --porcelain)" ]]; then
   echo "skip: working tree dirty"; exit 0
 fi
 
-LOCK="$HOME/Library/Logs/arrange-auto-ship.lock"
-exec 9>"$LOCK"
-if ! flock -n 9; then
-  echo "skip: another ship running"; exit 0
+LOCKDIR="$HOME/Library/Logs/arrange-auto-ship.lockdir"
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  if [ -n "$(find "$LOCKDIR" -prune -mmin +45 2>/dev/null)" ]; then
+    rm -rf "$LOCKDIR"
+    mkdir "$LOCKDIR"
+  else
+    echo "skip: another ship running"; exit 0
+  fi
 fi
+trap 'rm -rf "$LOCKDIR"' EXIT
 
 git fetch origin main --tags --quiet
 git checkout -B main origin/main --quiet
