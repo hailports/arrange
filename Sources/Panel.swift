@@ -567,13 +567,19 @@ final class MirrorPanelController: NSObject {
         setChromeActive(true)
         startHold()
         startLinkTimer()
-        reloadDisplays()
+        // Order front first, then force-reload: reloadDisplays() no-ops while ordered
+        // out (CPU-spin fix), which left the arrange canvas empty on every open.
+        window.makeKeyAndOrderFront(nil)
+        reloadDisplays(force: true)
         refreshEdges()
         rebuild()
-        window.makeKeyAndOrderFront(nil)
+        canvas.needsDisplay = true
         place()
         installMonitors()
-        DispatchQueue.main.async { [weak self] in self?.place() }
+        DispatchQueue.main.async { [weak self] in
+            self?.canvas.needsDisplay = true
+            self?.place()
+        }
     }
 
     @objc private func statusClicked(_ sender: Any?) {
@@ -693,24 +699,23 @@ final class MirrorPanelController: NSObject {
         placed = true
     }
 
-    private func reloadDisplays() {
+    private func reloadDisplays(force: Bool = false) {
         guard !canvas.isDragging else { return }
         // Closed panel stays idle: no UC probes, no wallpaper loads, no view rebuilds.
-        // show() refreshes when the user opens it. Reconfig storms during remote
-        // sessions used to keep the closed panel redrawing at ~180% CPU.
-        guard window.isVisible else { return }
-        refreshArrangement()
+        // show() passes force: true because nonactivating panels can lag isVisible.
+        // Reconfig storms during remote sessions used to keep the closed panel
+        // redrawing at ~180% CPU.
+        guard force || window.isVisible else { return }
+        refreshArrangement(loadWallpapers: force || window.isVisible)
         let signature = displays.map { "\($0.id) \(Int($0.origin.x)) \(Int($0.origin.y)) \($0.isVirtual)" }.joined(separator: "|")
             + "|" + (armedUniversalControlName ?? "")
-        if window.isVisible && signature != linkSignature {
+        if signature != linkSignature {
             linkSignature = signature
             rebuild()
-        } else if !window.isVisible {
-            linkSignature = signature
         }
     }
 
-    private func refreshArrangement() {
+    private func refreshArrangement(loadWallpapers: Bool = true) {
         var next = DisplayCatalog.current()
         let linked = UniversalControl.hasActiveLink()
         if !linked {
@@ -729,13 +734,13 @@ final class MirrorPanelController: NSObject {
             next.append(contentsOf: tiles)
         }
         displays = next
-        // Wallpapers are only needed for the open canvas; loading full desktop images
-        // into a closed panel was a big part of the 400MB+ footprint.
-        if window.isVisible {
+        // Always push tiles onto the canvas. Skipping this when isVisible was false
+        // left a blank arrange box after the CPU-spin fix.
+        canvas.displays = displays
+        if loadWallpapers {
             for display in displays where !display.isVirtual && wallpapers[display.id] == nil {
                 wallpapers[display.id] = DisplayCatalog.wallpaper(for: display.id)
             }
-            canvas.displays = displays
             canvas.wallpapers = wallpapers
             placeSidecarIfNeeded()
         }

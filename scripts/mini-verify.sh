@@ -21,7 +21,7 @@ trap 'rm -rf "$LOCKDIR"' EXIT
 git fetch origin main --quiet
 git checkout -B main origin/main --quiet
 # Force ad-hoc on the Mini — no CLVXPad identity there, and we do not install.
-ARRANGE_SIGN_IDENTITY="-" ./build.sh
+ARRANGE_SKIP_INSTALL=1 ARRANGE_SIGN_IDENTITY="-" ./build.sh
 ./Arrange.app/Contents/MacOS/Arrange --self-test
 # Do not leave a runnable menu-bar copy lying around as a temptation.
 rm -rf ./Arrange.app

@@ -28,3 +28,8 @@ if ! codesign --force --deep --sign "$SIGN" "$APP"; then
   codesign --force --deep --sign - "$APP"
 fi
 echo "built $APP"
+# MacBook local iterate: ARRANGE_INSTALL=1 copies into ~/Applications.
+# Mini verify / CI must not install — leave unset or set ARRANGE_SKIP_INSTALL=1.
+if [ "${ARRANGE_INSTALL:-0}" = "1" ] && [ "${ARRANGE_SKIP_INSTALL:-}" != "1" ]; then
+  "$ROOT/scripts/install-local.sh"
+fi
