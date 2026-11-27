@@ -1,2 +1,5 @@
 Arrange.app/
+Arrange-*.dmg
 .DS_Store
+*.updating.app
+Arrange.prev.app

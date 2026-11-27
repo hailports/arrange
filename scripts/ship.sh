@@ -30,8 +30,9 @@ BUILD=$((BUILD + 1))
 DMG="$("$ROOT/scripts/make-dmg.sh")"
 "$ROOT/scripts/install-local.sh"
 
-git add Info.plist Sources build.sh scripts .github 2>/dev/null || true
-git add -A
+# Never commit DMGs or the built app — Releases hold the binary.
+git add Info.plist Sources build.sh scripts .github README.md .gitignore
+git reset HEAD -- 'Arrange-*.dmg' 'Arrange.app' 2>/dev/null || true
 if ! git diff --cached --quiet; then
   git commit -m "Arrange $VERSION"
 fi
