@@ -16,9 +16,14 @@ if [[ -n "$(git status --porcelain)" ]]; then
   echo "skip: working tree dirty"; exit 0
 fi
 
-git fetch origin --tags --quiet
-git checkout main --quiet
-git pull --ff-only origin main --quiet
+LOCK="$HOME/Library/Logs/arrange-auto-ship.lock"
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  echo "skip: another ship running"; exit 0
+fi
+
+git fetch origin main --tags --quiet
+git checkout -B main origin/main --quiet
 
 HEAD="$(git rev-parse HEAD)"
 LATEST_TAG="$(gh release view --json tagName -q .tagName 2>/dev/null || true)"
@@ -26,6 +31,10 @@ if [ -n "$LATEST_TAG" ]; then
   TAG_COMMIT="$(git rev-list -n 1 "$LATEST_TAG" 2>/dev/null || true)"
   if [ "$TAG_COMMIT" = "$HEAD" ]; then
     echo "up to date at $LATEST_TAG ($HEAD)"; exit 0
+  fi
+  # Script/docs-only commits should not mint a new DMG.
+  if git diff --quiet "$LATEST_TAG"..HEAD -- Sources build.sh Info.plist; then
+    echo "no app changes since $LATEST_TAG (HEAD $HEAD)"; exit 0
   fi
 fi
 

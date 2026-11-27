@@ -7,9 +7,13 @@ mkdir -p "$(dirname "$LOG")"
 exec >>"$LOG" 2>&1
 echo "=== $(date) host=$(hostname) ==="
 cd "$ROOT"
-git fetch origin --quiet
-git checkout main --quiet
-git pull --ff-only origin main --quiet
+LOCK="$HOME/Library/Logs/arrange-mini-verify.lock"
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  echo "skip: another verify running"; exit 0
+fi
+git fetch origin main --quiet
+git checkout -B main origin/main --quiet
 # Force ad-hoc on the Mini — no CLVXPad identity there, and we do not install.
 ARRANGE_SIGN_IDENTITY="-" ./build.sh
 ./Arrange.app/Contents/MacOS/Arrange --self-test
