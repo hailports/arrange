@@ -15,8 +15,12 @@ private let labelMap: [String: String] = {
 func shownName(_ name: String) -> String { labelMap[UCArranger.fold(name)] ?? name }
 
 final class ArrangeCanvas: NSView {
-    var displays: [LayoutDisplay] = [] { didSet { needsDisplay = true } }
-    var wallpapers: [UInt32: NSImage] = [:] { didSet { needsDisplay = true } }
+    var displays: [LayoutDisplay] = [] {
+        didSet { if displays != oldValue { needsDisplay = true } }
+    }
+    var wallpapers: [UInt32: NSImage] = [:] {
+        didSet { if wallpapers.count != oldValue.count || wallpapers.keys != oldValue.keys { needsDisplay = true } }
+    }
     var onCommit: (([LayoutDisplay]) -> Void)?
 
     private(set) var isDragging = false
@@ -409,7 +413,8 @@ final class MirrorPanelController: NSObject {
         } else {
             let effect = NSVisualEffectView(frame: NSRect(x: 0, y: 0, width: 352, height: 480))
             effect.material = .popover
-            effect.state = .active
+            // Inactive until the panel is shown — .active keeps CA flushing forever.
+            effect.state = .inactive
             effect.wantsLayer = true
             effect.layer?.cornerRadius = 16
             effect.layer?.masksToBounds = true
@@ -424,6 +429,8 @@ final class MirrorPanelController: NSObject {
         window.hasShadow = true
         window.hidesOnDeactivate = false
         window.becomesKeyOnlyIfNeeded = false
+        // Keep the layer tree quiet while the menu is closed.
+        window.isReleasedWhenClosed = false
         window.contentView = chrome
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -447,13 +454,17 @@ final class MirrorPanelController: NSObject {
         canvas.heightAnchor.constraint(equalToConstant: 196).isActive = true
         canvas.onCommit = { [weak self] next in self?.commit(next) }
 
+        // Bonjour chatter must not rebuild the view tree while the panel is closed —
+        // that was a continuous CA redraw spin (wallpaper + shadows) at ~180% CPU.
         airBrowser.onUpdate = { [weak self] records in
-            self?.airRecords = records
-            self?.rebuild()
+            guard let self else { return }
+            self.airRecords = records
+            if self.window.isVisible { self.rebuild() }
         }
         nearbyBrowser.onUpdate = { [weak self] records in
-            self?.nearbyRecords = records
-            self?.reloadDisplays()
+            guard let self else { return }
+            self.nearbyRecords = records
+            if self.window.isVisible { self.scheduleReloadDisplays() }
         }
     }
 
@@ -507,19 +518,21 @@ final class MirrorPanelController: NSObject {
     private var holdTimer: Timer?
     private var linkTimer: Timer?
     private var linkSignature = ""
+    private var reloadWorkItem: DispatchWorkItem?
+    private var reconfigRegistered = false
+    private lazy var reconfigUserData = Unmanaged.passUnretained(self).toOpaque()
+
+    private static let reconfigCallback: CGDisplayReconfigurationCallBack = { _, flags, user in
+        guard let user else { return }
+        if flags.contains(.beginConfigurationFlag) { return }
+        let controller = Unmanaged<MirrorPanelController>.fromOpaque(user).takeUnretainedValue()
+        DispatchQueue.main.async { controller.scheduleReloadDisplays() }
+    }
 
     func install() {
-        ArrangementHold.touch()
-        holdTimer?.invalidate()
-        holdTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
-            ArrangementHold.touch()
-        }
-        // UC and Bonjour come up after login. Keep looking so a boot or a later link
-        // shows the iPad without reopening the panel.
-        linkTimer?.invalidate()
-        linkTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            self?.reloadDisplays()
-        }
+        // Do not keep arrangement-hold fresh forever. That made the topology watcher
+        // adopt mid-session origins and fight Screen Sharing before/after remotes.
+        // Hold is only armed while the panel is open (see show/close).
         let image = Self.statusImage()
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.image = image
@@ -528,28 +541,32 @@ final class MirrorPanelController: NSObject {
         item.button?.action = #selector(statusClicked(_:))
         item.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
         statusItem = item
-        reloadDisplays()
         airBrowser.start()
         nearbyBrowser.start()
-        CGDisplayRegisterReconfigurationCallback({ _, flags, user in
-            guard let user else { return }
-            if flags.contains(.beginConfigurationFlag) { return }
-            let controller = Unmanaged<MirrorPanelController>.fromOpaque(user).takeUnretainedValue()
-            DispatchQueue.main.async { controller.reloadDisplays() }
-        }, Unmanaged.passUnretained(self).toOpaque())
+        if !reconfigRegistered {
+            CGDisplayRegisterReconfigurationCallback(Self.reconfigCallback, reconfigUserData)
+            reconfigRegistered = true
+        }
     }
 
     func shutdown() {
-        holdTimer?.invalidate()
-        holdTimer = nil
-        linkTimer?.invalidate()
-        linkTimer = nil
+        stopHold()
+        stopLinkTimer()
+        reloadWorkItem?.cancel()
+        reloadWorkItem = nil
         ArrangementHold.clear()
         airBrowser.stop()
         nearbyBrowser.stop()
+        if reconfigRegistered {
+            CGDisplayRemoveReconfigurationCallback(Self.reconfigCallback, reconfigUserData)
+            reconfigRegistered = false
+        }
     }
 
     func show() {
+        setChromeActive(true)
+        startHold()
+        startLinkTimer()
         reloadDisplays()
         refreshEdges()
         rebuild()
@@ -581,8 +598,54 @@ final class MirrorPanelController: NSObject {
     }
 
     private func close() {
+        stopHold()
+        stopLinkTimer()
+        setChromeActive(false)
         window.orderOut(nil)
         removeMonitors()
+        // Drop heavy wallpaper bitmaps while the panel sleeps.
+        wallpapers.removeAll(keepingCapacity: false)
+        canvas.wallpapers = [:]
+    }
+
+    private func setChromeActive(_ on: Bool) {
+        if let effect = chrome as? NSVisualEffectView {
+            effect.state = on ? .active : .inactive
+        }
+    }
+
+    private func startHold() {
+        ArrangementHold.touch()
+        holdTimer?.invalidate()
+        holdTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { _ in
+            ArrangementHold.touch()
+        }
+    }
+
+    private func stopHold() {
+        holdTimer?.invalidate()
+        holdTimer = nil
+        ArrangementHold.clear()
+    }
+
+    /// Poll UC edges only while the panel is open. Closed = Bonjour + reconfig only.
+    private func startLinkTimer() {
+        linkTimer?.invalidate()
+        linkTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            self?.scheduleReloadDisplays()
+        }
+    }
+
+    private func stopLinkTimer() {
+        linkTimer?.invalidate()
+        linkTimer = nil
+    }
+
+    private func scheduleReloadDisplays() {
+        reloadWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.reloadDisplays() }
+        reloadWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: work)
     }
 
     private func installMonitors() {
@@ -632,6 +695,10 @@ final class MirrorPanelController: NSObject {
 
     private func reloadDisplays() {
         guard !canvas.isDragging else { return }
+        // Closed panel stays idle: no UC probes, no wallpaper loads, no view rebuilds.
+        // show() refreshes when the user opens it. Reconfig storms during remote
+        // sessions used to keep the closed panel redrawing at ~180% CPU.
+        guard window.isVisible else { return }
         refreshArrangement()
         let signature = displays.map { "\($0.id) \(Int($0.origin.x)) \(Int($0.origin.y)) \($0.isVirtual)" }.joined(separator: "|")
             + "|" + (armedUniversalControlName ?? "")
@@ -662,12 +729,16 @@ final class MirrorPanelController: NSObject {
             next.append(contentsOf: tiles)
         }
         displays = next
-        for display in displays where !display.isVirtual && wallpapers[display.id] == nil {
-            wallpapers[display.id] = DisplayCatalog.wallpaper(for: display.id)
+        // Wallpapers are only needed for the open canvas; loading full desktop images
+        // into a closed panel was a big part of the 400MB+ footprint.
+        if window.isVisible {
+            for display in displays where !display.isVirtual && wallpapers[display.id] == nil {
+                wallpapers[display.id] = DisplayCatalog.wallpaper(for: display.id)
+            }
+            canvas.displays = displays
+            canvas.wallpapers = wallpapers
+            placeSidecarIfNeeded()
         }
-        canvas.displays = displays
-        canvas.wallpapers = wallpapers
-        placeSidecarIfNeeded()
     }
 
     private func placeSidecarIfNeeded() {
@@ -696,6 +767,13 @@ final class MirrorPanelController: NSObject {
         let previous = displays
         let live = DisplayCatalog.current()
         let physical = arranged.filter { !$0.isVirtual }
+        if RemoteSession.isActive {
+            NSSound.beep()
+            NSLog("Arrange: refuse rearrange during remote session")
+            refreshArrangement()
+            rebuild()
+            return
+        }
         if !LayoutMath.sameArrangement(live, physical) {
             _ = DisplayCatalog.apply(physical)
         }
