@@ -95,6 +95,8 @@ final class ServiceBrowser {
     private var browseBuffer = ""
     private var resolvers: [String: Process] = [:]
     private var resolveSources: [String: DispatchSourceRead] = [:]
+    private var wantsRunning = false
+    private var restartWorkItem: DispatchWorkItem?
     private let type: String
     private let queue = DispatchQueue(label: "arrange.browse")
 
@@ -103,7 +105,29 @@ final class ServiceBrowser {
     }
 
     func start() {
-        guard browse == nil else { return }
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.wantsRunning = true
+            self.startBrowseLocked()
+        }
+    }
+
+    func stop() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.wantsRunning = false
+            self.restartWorkItem?.cancel()
+            self.restartWorkItem = nil
+            self.tearDownBrowseLocked()
+            for source in self.resolveSources.values { source.cancel() }
+            self.resolveSources.removeAll()
+            for process in self.resolvers.values { process.terminate() }
+            self.resolvers.removeAll()
+        }
+    }
+
+    private func startBrowseLocked() {
+        guard wantsRunning, browse == nil else { return }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/dns-sd")
         process.arguments = ["-B", type, "local."]
@@ -112,14 +136,23 @@ final class ServiceBrowser {
         process.standardError = Pipe()
         // FileHandle.readabilityHandler + availableData goes deaf on 27.2.1: the first
         // callback can be empty, and clearing the handler drops every later browse line.
+        // A closed pipe with a live DispatchSourceRead spins at 100% — cancel on EOF.
         let fd = pipe.fileHandleForReading.fileDescriptor
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         source.setEventHandler { [weak self] in
             guard let self else { return }
             var buffer = [UInt8](repeating: 0, count: 64 * 1024)
             let n = read(fd, &buffer, buffer.count)
-            guard n > 0 else { return }
-            self.ingest(String(bytes: buffer[..<n], encoding: .utf8) ?? "")
+            if n > 0 {
+                self.ingest(String(bytes: buffer[..<n], encoding: .utf8) ?? "")
+                return
+            }
+            if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) { return }
+            self.handleBrowseEOFLocked()
+        }
+        source.setCancelHandler {
+            // Keep the Pipe alive until cancel so the fd is not reused early.
+            _ = pipe
         }
         source.resume()
         browseSource = source
@@ -128,18 +161,33 @@ final class ServiceBrowser {
             browse = process
         } catch {
             fputs("dns-sd browse failed: \(error)\n", stderr)
+            source.cancel()
+            browseSource = nil
+            scheduleRestartLocked()
         }
     }
 
-    func stop() {
+    private func tearDownBrowseLocked() {
         browseSource?.cancel()
         browseSource = nil
         browse?.terminate()
         browse = nil
-        for source in resolveSources.values { source.cancel() }
-        resolveSources.removeAll()
-        for process in resolvers.values { process.terminate() }
-        resolvers.removeAll()
+        browseBuffer = ""
+    }
+
+    private func handleBrowseEOFLocked() {
+        tearDownBrowseLocked()
+        scheduleRestartLocked()
+    }
+
+    private func scheduleRestartLocked() {
+        guard wantsRunning else { return }
+        restartWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.startBrowseLocked()
+        }
+        restartWorkItem = work
+        queue.asyncAfter(deadline: .now() + 2, execute: work)
     }
 
     private func ingest(_ chunk: String) {
@@ -166,11 +214,17 @@ final class ServiceBrowser {
             if (counts[name] ?? 0) <= 0 {
                 counts[name] = nil
                 records[name] = nil
-                resolvers[name]?.terminate()
-                resolvers[name] = nil
+                finishResolve(name)
             }
         }
         publish()
+    }
+
+    private func finishResolve(_ name: String) {
+        resolveSources[name]?.cancel()
+        resolveSources[name] = nil
+        resolvers[name]?.terminate()
+        resolvers[name] = nil
     }
 
     private func resolve(_ name: String) {
@@ -187,26 +241,27 @@ final class ServiceBrowser {
             guard let self else { return }
             var buffer = [UInt8](repeating: 0, count: 64 * 1024)
             let n = read(fd, &buffer, buffer.count)
-            guard n > 0, let text = String(bytes: buffer[..<n], encoding: .utf8) else { return }
-            let fields = Self.fields(in: text)
-            guard !fields.isEmpty else { return }
-            if var record = self.records[name] {
-                record.fields.merge(fields) { _, new in new }
-                self.records[name] = record
-                self.publish()
+            if n > 0, let text = String(bytes: buffer[..<n], encoding: .utf8) {
+                let fields = Self.fields(in: text)
+                if !fields.isEmpty, var record = self.records[name] {
+                    record.fields.merge(fields) { _, new in new }
+                    self.records[name] = record
+                    self.publish()
+                }
+            } else if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return
             }
-            self.resolvers[name]?.terminate()
-            self.resolvers[name] = nil
-            self.resolveSources[name]?.cancel()
-            self.resolveSources[name] = nil
+            // dns-sd -L exits after one answer; cancel or the closed pipe spins the CPU.
+            self.finishResolve(name)
         }
+        source.setCancelHandler { _ = pipe }
         source.resume()
         resolveSources[name] = source
         do {
             try process.run()
             resolvers[name] = process
         } catch {
-            return
+            finishResolve(name)
         }
     }
 
@@ -315,6 +370,54 @@ enum ArrangementHold {
     }
 }
 
+/// Screen Sharing / High Performance / any :5900 viewer. Matches remote-display-topology-watch.
+enum RemoteSession {
+    private static var cachedAt: TimeInterval = 0
+    private static var cachedValue = false
+
+    static var isActive: Bool {
+        let now = Date().timeIntervalSince1970
+        if now - cachedAt < 2 { return cachedValue }
+        // pgrep first; netstat only if needed.
+        cachedValue = screensharingdRunning() || port5900Peer()
+        cachedAt = now
+        return cachedValue
+    }
+
+    private static func screensharingdRunning() -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        process.arguments = ["-xq", "screensharingd"]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        do { try process.run() } catch { return false }
+        process.waitUntilExit()
+        return process.terminationStatus == 0
+    }
+
+    private static func port5900Peer() -> Bool {
+        // Cheap path: only netstat when screensharingd is up, or as a fallback for
+        // brief gaps where the daemon name differs. Cached by isActive.
+        let pipe = Pipe()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/netstat")
+        process.arguments = ["-an", "-p", "tcp"]
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do { try process.run() } catch { return false }
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let text = String(data: data, encoding: .utf8) else { return false }
+        for line in text.split(separator: "\n") {
+            let parts = line.split(whereSeparator: { $0.isWhitespace })
+            guard parts.count >= 6, parts[5] == "ESTABLISHED" else { continue }
+            let local = String(parts[3]), remote = String(parts[4])
+            if local.hasSuffix(".5900"), remote != "*.*" { return true }
+        }
+        return false
+    }
+}
+
 enum DisplayCatalog {
     static func current() -> [LayoutDisplay] {
         var ids = [CGDirectDisplayID](repeating: 0, count: 16)
@@ -353,13 +456,22 @@ enum DisplayCatalog {
     }
 
     static func apply(_ displays: [LayoutDisplay]) -> Bool {
+        // Never fight Screen Sharing / High Performance, and never commit a partial
+        // list while the desk is still enumerating after a viewer leaves.
+        if RemoteSession.isActive {
+            NSLog("Arrange: skip display apply; remote session active")
+            return false
+        }
+        let live = current()
+        let physical = displays.filter { !$0.isVirtual }
+        guard !physical.isEmpty else { return true }
+        let liveIDs = Set(live.map(\.id))
+        guard physical.allSatisfy({ liveIDs.contains($0.id) }) else {
+            NSLog("Arrange: skip display apply; display list incomplete")
+            return false
+        }
         var config: CGDisplayConfigRef?
         guard CGBeginDisplayConfiguration(&config) == .success, let config else { return false }
-        let physical = displays.filter { !$0.isVirtual }
-        guard !physical.isEmpty else {
-            CGCancelDisplayConfiguration(config)
-            return true
-        }
         for display in physical {
             if CGConfigureDisplayMirrorOfDisplay(config, display.id, 0) != .success {
                 CGCancelDisplayConfiguration(config)
