@@ -7,6 +7,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         panel.install()
+        // MacBook menu-bar copies self-update from GitHub Releases. Mini never runs this app.
+        if ProcessInfo.processInfo.environment["ARRANGE_NO_UPDATE"] != "1" {
+            ArrangeUpdater.start()
+        }
         if ProcessInfo.processInfo.environment["ARRANGE_SHOW"] == "1" {
             DispatchQueue.main.async { self.panel.show() }
         } else {
@@ -32,10 +36,20 @@ enum ArrangeMain {
             let morning = ServiceBrowser.parseBrowse(" 7:24:38.331  Add        3  11 local.               _companion-link._tcp. alex's iPad pro")
             let parseOK = parsed?.add == true && parsed?.name == "Example TV" && (parsed?.type.hasPrefix("_airplay._tcp") == true)
                 && morning?.add == true && morning?.name == "alex's iPad pro"
+            let updateOK = ArrangeUpdater.isNewer("1.1", than: "1.0")
+                && ArrangeUpdater.isNewer("1.1.0", than: "1.0")
+                && !ArrangeUpdater.isNewer("1.0", than: "1.1")
             if !parseOK {
                 fputs("FAIL parseBrowse got \(String(describing: parsed))\n", stderr)
             }
-            exit((layoutOK && parseOK) ? 0 : 1)
+            if !updateOK {
+                fputs("FAIL ArrangeUpdater.isNewer\n", stderr)
+            }
+            exit((layoutOK && parseOK && updateOK) ? 0 : 1)
+        }
+        if CommandLine.arguments.contains("--check-update") {
+            ArrangeUpdater.check(forced: true)
+            exit(0)
         }
 
         signal(SIGTERM, SIG_IGN)

@@ -67,6 +67,12 @@ second during a move.
 - Placement precision is about ±1–2 canvas points. The Arrange sheet snaps.
 - One linked iPad at a time.
 
+## Ship, update, MacBook vs Mini
+
+- **MacBook (runs Arrange):** `scripts/ship.sh` builds, signs, installs to `~/Applications/Arrange.app`, pushes, and publishes a GitHub Release DMG. The app self-updates from Releases (~45s after launch, every 6h, on wake). `scripts/install-macbook-agents.sh` auto-ships when `main` moves. `scripts/enable-login.sh` loads the menu-bar LaunchAgent.
+- **Mac Mini (build only):** never install or launch Arrange. `scripts/mini-verify.sh` pulls, builds ad-hoc, runs `--self-test`, deletes the app. `scripts/install-mini-agents.sh` runs that hourly.
+- Switch `gh` to **hailports** before shipping (`gh auth switch`).
+
 ## Build and run
 
 ```bash

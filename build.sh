@@ -16,6 +16,7 @@ swiftc -parse-as-library -O -swift-version 5 \
   "$ROOT/Sources/Layout.swift" \
   "$ROOT/Sources/Services.swift" \
   "$ROOT/Sources/Arranger.swift" \
+  "$ROOT/Sources/Updater.swift" \
   "$ROOT/Sources/Panel.swift" \
   "$ROOT/Sources/main.swift" \
   "$OBJ"
